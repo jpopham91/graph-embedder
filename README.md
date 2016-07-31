@@ -10,3 +10,8 @@ graph = graph.parse('/path/to/input/file')
 model = RelationalModel(8)
 model.fit(graph)
 ```
+## TODO
+
+- Make all tensorflow/training parameters configurable
+- Add alternate embedding models
+- Write tests
