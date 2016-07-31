@@ -9,6 +9,8 @@ graph = graph.parse('/path/to/input/file')
 
 model = RelationalModel(8)
 model.fit(graph)
+
+model.get_embeddings()
 ```
 ## TODO
 
