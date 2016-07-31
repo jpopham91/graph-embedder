@@ -14,6 +14,10 @@ model.get_embeddings()
 ```
 ## TODO
 
-- Make all tensorflow/training parameters configurable
+- Make all tensorflow/training parameters configurable (optimizer, learning rate, etc.)
 - Add alternate embedding models
 - Write tests
+- Create embeddings class or utilities module
+  - nearest neighbors
+  - performance metrics
+  - ...
