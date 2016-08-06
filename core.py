@@ -128,29 +128,17 @@ class TransE(object):
                                                         self.link: [p],
                                                         self.pos_tail: [o]})
 
-        alts = np.array([*set(np.arange(m)) - {[i]}])
+        alt_ids = set(np.arange(m)) - set([i])
+        alts = np.array([*alt_ids])
         cdist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: alts,
                                                          self.link: np.ones_like(alts) * p,
                                                          self.pos_tail: np.ones_like(alts) * o})
 
-        return np.sum(dist < cdist)
+        return np.sum(dist > cdist)
 
-    def _mean_rank(self):
-        arr = self.tarray.arr
-        carr = corrupt(arr, self.tarray.n_entities)
+    def _mean_rank(self, k=10):
+        return np.mean([self._one_rank(i) for i in np.random.random_integers(0, self.tarray.n_entities, k)])
 
-        semb = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: arr[:,0]})
-        pemb = self._sess.run(self.link_vec,     feed_dict={self.link: arr[:,1]})
-        oemb = self._sess.run(self.pos_tail_vec, feed_dict={self.pos_tail: arr[:,2]})
-
-        csemb = self._sess.run(self.neg_head_vec, feed_dict={self.neg_head: carr[:,0]})
-        cpemb = self._sess.run(self.link_vec,     feed_dict={self.link: carr[:,1]})
-        coemb = self._sess.run(self.neg_tail_vec, feed_dict={self.neg_tail: carr[:,2]})
-
-        dists = np.sqrt(np.sum(np.square((semb + pemb) - oemb), axis=1))
-        cdists = np.sqrt(np.sum(np.square((csemb + cpemb) - coemb), axis=1))
-
-        return np.sum(np.median(dists) > cdists) / len(cdists)
 
     def _rdj_test(self):
         eemb = self._entity_embeddings
@@ -180,22 +168,24 @@ class TransE(object):
     def embeddings(self):
         return pd.concat((self._entity_embeddings, self._predicate_embeddings))
 
-    def fit(self, graph, batch_size=1024, num_epochs=10):
-        if type(graph) in [rdflib.graph.Graph, pd.core.frame.DataFrame]:
-            print('Vectorizing graph... ', end='', flush=True)
-            self.tarray = TripleArray(graph)
-            print('Done.')
-        elif type(graph) is TripleArray:
-            self.tarray = graph
-        else:
-            raise TypeError("Unexpected type: %s" % type(graph))
+    def fit(self, graph, batch_size=1024, num_epochs=10, early_stopping_rounds=5, early_stopping_tolerance=1e-6, warm_start=False):
+        if not warm_start:
+            if type(graph) in [rdflib.graph.Graph, pd.core.frame.DataFrame]:
+                print('Vectorizing graph... ', end='', flush=True)
+                self.tarray = TripleArray(graph)
+                print('Done.')
+            elif type(graph) is TripleArray:
+                self.tarray = graph
+            else:
+                raise TypeError("Unexpected type: %s" % type(graph))
 
-        self._setup_session(self.tarray.n_entities, self.tarray.n_predicates)
+            self.tarray.arr = np.random.permutation(self.tarray.arr)
+            self._setup_session(self.tarray.n_entities, self.tarray.n_predicates)
+
         self.rank_hist = []
         self.loss_hist = []
         n_batches = int(len(self.tarray.arr)/batch_size)
         for epoch in range(num_epochs):
-            self.tarray.arr = np.random.permutation(self.tarray.arr)
             epoch_start = time.time()
             epoch_losses = []
             for i in range(n_batches):
@@ -217,6 +207,7 @@ class TransE(object):
 
             self.rank_hist.append(self._mean_rank())
             self.loss_hist.append(np.mean(epoch_losses))
-            print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}, Mean Rank: {:.3f}'.format(epoch, elapsed, self.loss_hist[-1], self.rank_hist[-1]))
+            # print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}, Mean Rank: {:.0f}/{:.0f}'.format(epoch, elapsed, self.loss_hist[-1], self.rank_hist[-1], self.tarray.n_entities))
+            print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}'.format(epoch, elapsed, self.loss_hist[-1]))
             # print(self._rdj_test())
             self.last_epoch = epoch
