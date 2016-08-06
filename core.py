@@ -4,23 +4,56 @@ import numpy as np
 import pandas as pd
 import time
 import rdflib
-import re
-import pickle
+
 
 def invert(d: dict) -> dict:
     return dict([(v,k) for k,v in d.items()])
 
+
+def corrupt(mat, n_entities):
+    out = mat.copy()
+    new_entities = np.random.random_integers(0, n_entities-1, len(mat))
+    mask = (np.random.rand(len(mat))+1/2).astype(np.int)
+    inv_mask = np.abs(mask-1)
+    out[:,0] *= mask
+    out[:,2] *= inv_mask
+    out[:,0] += inv_mask * new_entities
+    out[:,2] += mask * new_entities
+    return out
+
+def L1_dist(a, b):
+    return tf.reduce_sum(tf.abs(a-b), 1)
+
+def L2_dist(a, b):
+    return tf.sqrt(tf.reduce_sum(tf.square(a-b), 1))
+
+
+def margin_cost(pos, neg, margin=1.):
+    out = margin + pos - neg
+    # grad is non-zero only within a certain margin
+    in_margin = tf.to_float(tf.greater(out, 0))
+    return tf.reduce_sum(out * in_margin)
+
+
 class TripleArray(object):
     def __init__(self, graph):
-        self.triples = pd.DataFrame(
-            [(str(s), str(p), str(o)) for (s,p,o) in graph if type(o) == rdflib.term.URIRef],
-            columns=['s', 'p', 'o']
-        )
+        if type(graph) is rdflib.graph.Graph:
+            print("%s == %s" % (type(graph), rdflib.graph.Graph))
+            self.triples = pd.DataFrame(
+                [(str(s), str(p), str(o)) for (s,p,o) in graph if type(o) == rdflib.term.URIRef],
+                columns=['s', 'p', 'o']
+            )
+        elif type(graph) is np.ndarray:
+            self.triples = pd.DataFrame(graph, columns=['s', 'p', 'o'])
+        elif type(graph) is pd.core.frame.DataFrame:
+            self.triples = graph
+        else:
+            raise TypeError("Unexpected type: %s" % type(graph))
 
-        entities            = set(self.triples.s.values) | set(self.triples.o.values)
-        predicates          = set(self.triples.p.values)
-        self.entity_dict    = dict(enumerate(entities))
-        self.predicate_dict = dict(enumerate(predicates))
+        self.entities            = set(self.triples.s.values) | set(self.triples.o.values)
+        self.predicates          = set(self.triples.p.values)
+        self.entity_dict    = dict(enumerate(self.entities))
+        self.predicate_dict = dict(enumerate(self.predicates))
         self.entity_ids     = invert(self.entity_dict)
         self.predicate_ids  = invert(self.predicate_dict)
 
@@ -38,37 +71,24 @@ class TripleArray(object):
     def n_predicates(self):
         return len(self.predicate_dict)
 
-def corrupt(mat, n_entities):
-    out = mat.copy()
-    new_entities = np.random.random_integers(0, n_entities-1, len(mat))
-    mask = (np.random.rand(len(mat))+1/2).astype(np.int)
-    inv_mask = np.abs(mask-1)
-    out[:,0] *= mask
-    out[:,2] *= inv_mask
-    out[:,0] += inv_mask * new_entities
-    out[:,2] += mask * new_entities
-    return out
 
-def L2_dist(a, b):
-    return tf.sqrt(tf.reduce_sum(tf.square(a-b)))
-
-def margin_cost(pos, neg, margin=1.):
-    out = margin + pos - neg
-    # grad is non-zero only within a certain margin
-    in_margin = tf.to_float(tf.greater(out, 0))
-    return tf.reduce_sum(out * in_margin)
-
-class RelationalModel(object):
-    def __init__(self, dim):
+class TransE(object):
+    def __init__(self,
+                 dim,
+                 optimizer=tf.train.GradientDescentOptimizer(0.01),
+                 margin=1.):
         self.dim = dim
+        self.optimizer = optimizer
+        self.margin = margin
 
     def _setup_session(self, n_entities, n_predicates):
+        '''Builds the TransE computational graph using tensorflow'''
         bound = 6/np.sqrt(self.dim)
         with tf.name_scope('initialize_embeddings') as scope:
-            self.entity_embeddings    = tf.Variable(tf.random_uniform([n_entities, self.dim],-bound, +bound),
-                                                    name='entity_embeddings')
-            self.predicate_embeddings = tf.Variable(tf.random_uniform([n_predicates, self.dim],-bound, +bound),
-                                                    name='predicate_embeddings')
+            self.entity_embeddings    = tf.Variable(tf.random_uniform([n_entities, self.dim], -bound, +bound),
+                                               name='entity_embeddings')
+            self.predicate_embeddings = tf.Variable(tf.random_uniform([n_predicates, self.dim], -bound, +bound),
+                                               name='predicate_embeddings')
 
         with tf.name_scope('read_inputs') as scope:
             self.pos_head = tf.placeholder(tf.int32, [None], name='positive_head')
@@ -79,31 +99,70 @@ class RelationalModel(object):
 
         with tf.name_scope('lookup_embeddings') as scope:
             self.pos_head_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.pos_head)
-            pos_tail_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.pos_tail)
-            neg_head_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.neg_head)
-            neg_tail_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.neg_tail)
+            self.pos_tail_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.pos_tail)
+            self.neg_head_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.neg_head)
+            self.neg_tail_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.neg_tail)
             self.link_vec     = tf.nn.embedding_lookup(self.predicate_embeddings, self.link)
 
         with tf.name_scope('normalize_embeddings') as scope:
-            pos_head_vec = tf.nn.l2_normalize(self.pos_head_vec, 1)
-            pos_tail_vec = tf.nn.l2_normalize(pos_tail_vec, 1)
-            neg_head_vec = tf.nn.l2_normalize(neg_head_vec, 1)
-            neg_tail_vec = tf.nn.l2_normalize(neg_tail_vec, 1)
+            self.pos_head_vec = tf.nn.l2_normalize(self.pos_head_vec, 1)
+            self.pos_tail_vec = tf.nn.l2_normalize(self.pos_tail_vec, 1)
+            self.neg_head_vec = tf.nn.l2_normalize(self.neg_head_vec, 1)
+            self.neg_tail_vec = tf.nn.l2_normalize(self.neg_tail_vec, 1)
 
         with tf.name_scope('train') as scope:
             # compute loss for true and corrupted triple
-            pos_dist = L2_dist(tf.add(self.pos_head_vec, self.link_vec), pos_tail_vec)
-            neg_dist = L2_dist(tf.add(neg_head_vec, self.link_vec), neg_tail_vec)
-            diff = neg_dist - pos_dist
-            loss = margin_cost(pos_dist, neg_dist, np.sqrt(self.dim))
-#             self.train = tf.train.GradientDescentOptimizer(0.001).minimize(loss)
-#             self.train = tf.train.AdamOptimizer(epsilon=1e-15).minimize(loss)
-            self.train = tf.train.AdadeltaOptimizer(0.01).minimize(loss)
-
+            self.pos_dist = L1_dist(tf.add(self.pos_head_vec, self.link_vec), self.pos_tail_vec)
+            self.neg_dist = L1_dist(tf.add(self.neg_head_vec, self.link_vec), self.neg_tail_vec)
+            diff = self.neg_dist - self.pos_dist
+            self.loss = margin_cost(self.pos_dist, self.neg_dist, self.margin)
+            self.train = self.optimizer.minimize(self.loss)
 
         self._sess = tf.Session()
-        init = tf.initialize_all_variables()
-        self._sess.run(init)
+        self._sess.run(tf.initialize_all_variables())
+
+    def _one_rank(self, i):
+        s,p,o = self.tarray.arr[i]
+        m = self.tarray.n_entities
+        dist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: [s],
+                                                        self.link: [p],
+                                                        self.pos_tail: [o]})
+
+        alts = np.array([*set(np.arange(m)) - {[i]}])
+        cdist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: alts,
+                                                         self.link: np.ones_like(alts) * p,
+                                                         self.pos_tail: np.ones_like(alts) * o})
+
+        return np.sum(dist < cdist)
+
+    def _mean_rank(self):
+        arr = self.tarray.arr
+        carr = corrupt(arr, self.tarray.n_entities)
+
+        semb = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: arr[:,0]})
+        pemb = self._sess.run(self.link_vec,     feed_dict={self.link: arr[:,1]})
+        oemb = self._sess.run(self.pos_tail_vec, feed_dict={self.pos_tail: arr[:,2]})
+
+        csemb = self._sess.run(self.neg_head_vec, feed_dict={self.neg_head: carr[:,0]})
+        cpemb = self._sess.run(self.link_vec,     feed_dict={self.link: carr[:,1]})
+        coemb = self._sess.run(self.neg_tail_vec, feed_dict={self.neg_tail: carr[:,2]})
+
+        dists = np.sqrt(np.sum(np.square((semb + pemb) - oemb), axis=1))
+        cdists = np.sqrt(np.sum(np.square((csemb + cpemb) - coemb), axis=1))
+
+        return np.sum(np.median(dists) > cdists) / len(cdists)
+
+    def _rdj_test(self):
+        eemb = self._entity_embeddings
+        pemb = self._predicate_embeddings
+
+        terminator = eemb.ix['http://data.linkedmdb.org/resource/film/38151'].values
+        notebook = eemb.ix['http://data.linkedmdb.org/resource/film/55823'].values
+
+        actor = pemb.ix['http://data.linkedmdb.org/resource/movie/actor'].values
+        arnold = eemb.ix['http://data.linkedmdb.org/resource/actor/29369'].values
+
+        return np.sqrt(np.sum(np.square(terminator + actor - arnold))), np.sqrt(np.sum(np.square(notebook + actor - arnold)))
 
     @property
     def _entity_embeddings(self):
@@ -118,19 +177,27 @@ class RelationalModel(object):
         return pd.DataFrame(data=data, index=urns)
 
     @property
-    def get_embeddings(self):
+    def embeddings(self):
         return pd.concat((self._entity_embeddings, self._predicate_embeddings))
 
     def fit(self, graph, batch_size=1024, num_epochs=10):
-        print('Vectorizing graph...', end='')
-        sys.stdout.flush()
-        self.tarray = TripleArray(graph)
-        print('Done')
+        if type(graph) in [rdflib.graph.Graph, pd.core.frame.DataFrame]:
+            print('Vectorizing graph... ', end='', flush=True)
+            self.tarray = TripleArray(graph)
+            print('Done.')
+        elif type(graph) is TripleArray:
+            self.tarray = graph
+        else:
+            raise TypeError("Unexpected type: %s" % type(graph))
+
         self._setup_session(self.tarray.n_entities, self.tarray.n_predicates)
         self.rank_hist = []
+        self.loss_hist = []
         n_batches = int(len(self.tarray.arr)/batch_size)
         for epoch in range(num_epochs):
+            self.tarray.arr = np.random.permutation(self.tarray.arr)
             epoch_start = time.time()
+            epoch_losses = []
             for i in range(n_batches):
                 sample = self.tarray.arr[i*batch_size:(i+1)*batch_size]
                 corrupt_sample = corrupt(sample, self.tarray.n_entities)
@@ -140,29 +207,16 @@ class RelationalModel(object):
                          self.neg_head: corrupt_sample[:,0],
                          self.neg_tail: corrupt_sample[:,2]}
 
-                self._sess.run(self.train, feed_dict=feed)
+                _, loss = self._sess.run([self.train, self.loss], feed_dict=feed)
+                loss /= len(sample)
+                epoch_losses.append(loss)
 
                 elapsed = time.time() - epoch_start
                 remaining = (n_batches - i) * (elapsed / (1.0 + i))
-                print('Batch: {:d}/{:d}, ETA: {:.0f} s'.format(i, n_batches, remaining), end='\r')
+                print('Batch: {:d}/{:d}, Loss: {:.3f}, ETA: {:.0f} s'.format(i, n_batches, np.mean(epoch_losses), remaining), end='\r')
 
-            self.rank_hist.append(self.mean_rank())
-            print('Epoch {:d} took: {:.0f} s, Mean Rank: {:.3f}'.format(epoch, elapsed, self.rank_hist[-1]))
+            self.rank_hist.append(self._mean_rank())
+            self.loss_hist.append(np.mean(epoch_losses))
+            print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}, Mean Rank: {:.3f}'.format(epoch, elapsed, self.loss_hist[-1], self.rank_hist[-1]))
+            # print(self._rdj_test())
             self.last_epoch = epoch
-
-    def mean_rank(self):
-        arr = self.tarray.arr
-        carr = corrupt(arr, self.tarray.n_entities)
-
-        semb = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: arr[:,0]})
-        pemb = self._sess.run(self.link_vec,     feed_dict={self.link: arr[:,1]})
-        oemb = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: arr[:,2]})
-
-        csemb = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: carr[:,0]})
-        cpemb = self._sess.run(self.link_vec,     feed_dict={self.link: carr[:,1]})
-        coemb = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: carr[:,2]})
-
-        dists = np.sqrt(np.sum(np.square((semb + pemb) - oemb), axis=1))
-        cdists = np.sqrt(np.sum(np.square((csemb + cpemb) - coemb), axis=1))
-
-        return (cdists > dists.mean()).sum() / len(cdists)
