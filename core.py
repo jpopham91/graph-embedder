@@ -130,27 +130,36 @@ class TransE(object):
 
         alt_ids = set(np.arange(m)) - set([i])
         alts = np.array([*alt_ids])
-        cdist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: alts,
-                                                         self.link: np.ones_like(alts) * p,
-                                                         self.pos_tail: np.ones_like(alts) * o})
+        chdist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: alts,
+                                                          self.link: np.ones_like(alts) * p,
+                                                          self.pos_tail: np.ones_like(alts) * o})
 
-        return np.sum(dist > cdist)
+        ctdist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: np.ones_like(alts) * s,
+                                                          self.link: np.ones_like(alts) * p,
+                                                          self.pos_tail: alts})
+
+        return np.sum(dist > chdist)/2 + np.sum(dist > ctdist)/2
 
     def _mean_rank(self, k=10):
         return np.mean([self._one_rank(i) for i in np.random.random_integers(0, self.tarray.n_entities, k)])
 
+    def mean_rank_appx(self):
+        arr = self.tarray.arr
+        carr = corrupt(arr, self.tarray.n_entities)
 
-    def _rdj_test(self):
-        eemb = self._entity_embeddings
-        pemb = self._predicate_embeddings
+        semb = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: arr[:,0]})
+        pemb = self._sess.run(self.link_vec,     feed_dict={self.link: arr[:,1]})
+        oemb = self._sess.run(self.pos_tail_vec, feed_dict={self.pos_tail: arr[:,2]})
 
-        terminator = eemb.ix['http://data.linkedmdb.org/resource/film/38151'].values
-        notebook = eemb.ix['http://data.linkedmdb.org/resource/film/55823'].values
+        csemb = self._sess.run(self.neg_head_vec, feed_dict={self.neg_head: carr[:,0]})
+        cpemb = self._sess.run(self.link_vec,     feed_dict={self.link: carr[:,1]})
+        coemb = self._sess.run(self.neg_tail_vec, feed_dict={self.neg_tail: carr[:,2]})
 
-        actor = pemb.ix['http://data.linkedmdb.org/resource/movie/actor'].values
-        arnold = eemb.ix['http://data.linkedmdb.org/resource/actor/29369'].values
+        dists = np.sqrt(np.sum(np.square((semb + pemb) - oemb), axis=1))
+        cdists = np.sqrt(np.sum(np.square((csemb + cpemb) - coemb), axis=1))
 
-        return np.sqrt(np.sum(np.square(terminator + actor - arnold))), np.sqrt(np.sum(np.square(notebook + actor - arnold)))
+        return (cdists < dists.mean()).sum() #/ len(cdists)
+
 
     @property
     def _entity_embeddings(self):
@@ -205,9 +214,10 @@ class TransE(object):
                 remaining = (n_batches - i) * (elapsed / (1.0 + i))
                 print('Batch: {:d}/{:d}, Loss: {:.3f}, ETA: {:.0f} s'.format(i, n_batches, np.mean(epoch_losses), remaining), end='\r')
 
-            self.rank_hist.append(self._mean_rank())
+            self.rank_hist.append(self.mean_rank_appx())
             self.loss_hist.append(np.mean(epoch_losses))
-            # print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}, Mean Rank: {:.0f}/{:.0f}'.format(epoch, elapsed, self.loss_hist[-1], self.rank_hist[-1], self.tarray.n_entities))
-            print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}'.format(epoch, elapsed, self.loss_hist[-1]))
+            print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}, Mean Rank: {:.0f}/{:.0f} ({:.2f})'.format(
+                epoch, elapsed, self.loss_hist[-1], self.rank_hist[-1], len(self.tarray.arr), self.rank_hist[-1]/len(self.tarray.arr)))
+            # print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}'.format(epoch, elapsed, self.loss_hist[-1]))
             # print(self._rdj_test())
             self.last_epoch = epoch
