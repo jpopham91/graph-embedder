@@ -1,223 +1,133 @@
-import tensorflow as tf
-import sys
 import numpy as np
-import pandas as pd
-import time
-import rdflib
+import torch
+from time import time
+from torch.autograd import Variable
+from IPython.display import clear_output
 
 
-def invert(d: dict) -> dict:
-    return dict([(v,k) for k,v in d.items()])
+def corrupt(X, num_e):
+    Xc = X.data.clone()
+    corrupted = (torch.rand(len(X)) * (num_e - 1)).long()
+
+    mask = (torch.rand(len(X)) + 1 / 2).long()
+    imask = (mask - 1) * -1
+
+    Xc[:, 0] *= mask
+    Xc[:, 2] *= imask
+
+    Xc[:, 0] += imask * corrupted
+    Xc[:, 2] += mask * corrupted
+    return Variable(Xc)
 
 
-def corrupt(mat, n_entities):
-    out = mat.copy()
-    new_entities = np.random.random_integers(0, n_entities-1, len(mat))
-    mask = (np.random.rand(len(mat))+1/2).astype(np.int)
-    inv_mask = np.abs(mask-1)
-    out[:,0] *= mask
-    out[:,2] *= inv_mask
-    out[:,0] += inv_mask * new_entities
-    out[:,2] += mask * new_entities
-    return out
-
-def L1_dist(a, b):
-    return tf.reduce_sum(tf.abs(a-b), 1)
-
-def L2_dist(a, b):
-    return tf.sqrt(tf.reduce_sum(tf.square(a-b), 1))
+def L2(a, b, axis=1):
+    return (a - b).pow(2).sum(axis)
 
 
-def margin_cost(pos, neg, margin=1.):
-    out = margin + pos - neg
-    # grad is non-zero only within a certain margin
-    in_margin = tf.to_float(tf.greater(out, 0))
-    return tf.reduce_sum(out * in_margin)
-
-
-class TripleArray(object):
-    def __init__(self, graph):
-        if type(graph) is rdflib.graph.Graph:
-            print("%s == %s" % (type(graph), rdflib.graph.Graph))
-            self.triples = pd.DataFrame(
-                [(str(s), str(p), str(o)) for (s,p,o) in graph if type(o) == rdflib.term.URIRef],
-                columns=['s', 'p', 'o']
-            )
-        elif type(graph) is np.ndarray:
-            self.triples = pd.DataFrame(graph, columns=['s', 'p', 'o'])
-        elif type(graph) is pd.core.frame.DataFrame:
-            self.triples = graph
-        else:
-            raise TypeError("Unexpected type: %s" % type(graph))
-
-        self.entities            = set(self.triples.s.values) | set(self.triples.o.values)
-        self.predicates          = set(self.triples.p.values)
-        self.entity_dict    = dict(enumerate(self.entities))
-        self.predicate_dict = dict(enumerate(self.predicates))
-        self.entity_ids     = invert(self.entity_dict)
-        self.predicate_ids  = invert(self.predicate_dict)
-
-        self.arr = np.array([
-            self.triples.s.apply(self.entity_ids.get),
-            self.triples.p.apply(self.predicate_ids.get),
-            self.triples.o.apply(self.entity_ids.get)
-        ]).T
-
-    @property
-    def n_entities(self):
-        return len(self.entity_dict)
-
-    @property
-    def n_predicates(self):
-        return len(self.predicate_dict)
-
-
-class TransE(object):
-    def __init__(self,
-                 dim,
-                 optimizer=tf.train.GradientDescentOptimizer(0.01),
-                 margin=1.):
+class TransE(torch.nn.Module):
+    def __init__(self, dim, margin=1.0, optimizer=torch.optim.SGD, **kwargs):
+        super(TransE, self).__init__()
         self.dim = dim
-        self.optimizer = optimizer
         self.margin = margin
+        self._optimizer_class = optimizer
+        self.init = False
+        if optimizer is torch.optim.SGD and 'lr' not in kwargs.keys():
+            kwargs['lr'] = 0.1
+        self.kwargs = kwargs
 
-    def _setup_session(self, n_entities, n_predicates):
-        '''Builds the TransE computational graph using tensorflow'''
-        bound = 6/np.sqrt(self.dim)
-        with tf.name_scope('initialize_embeddings') as scope:
-            self.entity_embeddings    = tf.Variable(tf.random_uniform([n_entities, self.dim], -bound, +bound),
-                                               name='entity_embeddings')
-            self.predicate_embeddings = tf.Variable(tf.random_uniform([n_predicates, self.dim], -bound, +bound),
-                                               name='predicate_embeddings')
+    def _init_embeddings(self):
+        bound = 6 / np.sqrt(self.dim)
+        self.E = torch.nn.Embedding(self.num_e, self.dim)
+        self.E.weight.data = 2 * bound * torch.rand(self.num_e, self.dim) - bound
 
-        with tf.name_scope('read_inputs') as scope:
-            self.pos_head = tf.placeholder(tf.int32, [None], name='positive_head')
-            self.pos_tail = tf.placeholder(tf.int32, [None], name='positive_tail')
-            self.neg_head = tf.placeholder(tf.int32, [None], name='corrupted_head')
-            self.neg_tail = tf.placeholder(tf.int32, [None], name='corrupted_tail')
-            self.link     = tf.placeholder(tf.int32, [None], name='link')
+        self.R = torch.nn.Embedding(self.num_r, self.dim)
+        self.R.weight.data = 2 * bound * torch.rand(self.num_r, self.dim) - bound
+        self._normalize_embeddings(self.R)
 
-        with tf.name_scope('lookup_embeddings') as scope:
-            self.pos_head_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.pos_head)
-            self.pos_tail_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.pos_tail)
-            self.neg_head_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.neg_head)
-            self.neg_tail_vec = tf.nn.embedding_lookup(self.entity_embeddings, self.neg_tail)
-            self.link_vec     = tf.nn.embedding_lookup(self.predicate_embeddings, self.link)
+        self.optimizer = self._optimizer_class([self.E.weight, self.R.weight], **self.kwargs)
+        self.init = True
 
-        with tf.name_scope('normalize_embeddings') as scope:
-            self.pos_head_vec = tf.nn.l2_normalize(self.pos_head_vec, 1)
-            self.pos_tail_vec = tf.nn.l2_normalize(self.pos_tail_vec, 1)
-            self.neg_head_vec = tf.nn.l2_normalize(self.neg_head_vec, 1)
-            self.neg_tail_vec = tf.nn.l2_normalize(self.neg_tail_vec, 1)
+    def _normalize_embeddings(self, emb):
+        row_norm = torch.sqrt(emb.weight.data.pow(2).sum(1))
+        emb.weight.data /= row_norm.expand(len(emb.weight), self.dim)
 
-        with tf.name_scope('train') as scope:
-            # compute loss for true and corrupted triple
-            self.pos_dist = L1_dist(tf.add(self.pos_head_vec, self.link_vec), self.pos_tail_vec)
-            self.neg_dist = L1_dist(tf.add(self.neg_head_vec, self.link_vec), self.neg_tail_vec)
-            diff = self.neg_dist - self.pos_dist
-            self.loss = margin_cost(self.pos_dist, self.neg_dist, self.margin)
-            self.train = self.optimizer.minimize(self.loss)
+    def _dist(self, X):
+        if type(X) is torch.LongTensor:
+            X = Variable(X)
+        h = self.E(X[:, 0])
+        r = self.R(X[:, 1])
+        t = self.E(X[:, 2])
+        return L2(h + r, t)
 
-        self._sess = tf.Session()
-        self._sess.run(tf.initialize_all_variables())
+    def _one_mean_rank(self, x):
+        if x.ndimension() is 1:
+            x = x.unsqueeze(0)
 
-    def _one_rank(self, i):
-        s,p,o = self.tarray.arr[i]
-        m = self.tarray.n_entities
-        dist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: [s],
-                                                        self.link: [p],
-                                                        self.pos_tail: [o]})
+        dist = self._dist(x).data[0][0]
 
-        alt_ids = set(np.arange(m)) - set([i])
-        alts = np.array([*alt_ids])
-        chdist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: alts,
-                                                          self.link: np.ones_like(alts) * p,
-                                                          self.pos_tail: np.ones_like(alts) * o})
+        Xc = torch.LongTensor(2 * self.num_e, 3)
+        Xc[:, 0] = x.data[0][0]
+        Xc[:, 1] = x.data[0][1]
+        Xc[:, 2] = x.data[0][2]
 
-        ctdist = self._sess.run(self.pos_dist, feed_dict={self.pos_head: np.ones_like(alts) * s,
-                                                          self.link: np.ones_like(alts) * p,
-                                                          self.pos_tail: alts})
+        Xc[:self.num_e, 0] = torch.arange(0, self.num_e)
+        Xc[self.num_e:, 2] = torch.arange(0, self.num_e)
 
-        return np.sum(dist > chdist)/2 + np.sum(dist > ctdist)/2
+        cdist = self._dist(Variable(Xc)).data
+        return (dist > cdist).sum()
 
-    def _mean_rank(self, k=10):
-        return np.mean([self._one_rank(i) for i in np.random.random_integers(0, self.tarray.n_entities, k)])
+    def _appx_mean_rank(self, X):
+        dist, cdist = self.forward(X)
+        self.optimizer.zero_grad()
+        return (dist.mean().data[0] > cdist).sum().data[0]
 
-    def mean_rank_appx(self):
-        arr = self.tarray.arr
-        carr = corrupt(arr, self.tarray.n_entities)
+    def forward(self, X):
+        Xc = corrupt(X, self.num_e)
+        return self._dist(X), self._dist(Xc)
 
-        semb = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: arr[:,0]})
-        pemb = self._sess.run(self.link_vec,     feed_dict={self.link: arr[:,1]})
-        oemb = self._sess.run(self.pos_tail_vec, feed_dict={self.pos_tail: arr[:,2]})
+    def _get_embedding_sizes(self, X):
+        self.num_e = 1 + max(X.data[:, 0].max(), X.data[:, 2].max())
+        self.num_r = 1 + X.data[:, 1].max()
+        return self.num_e, self.num_r
 
-        csemb = self._sess.run(self.neg_head_vec, feed_dict={self.neg_head: carr[:,0]})
-        cpemb = self._sess.run(self.link_vec,     feed_dict={self.link: carr[:,1]})
-        coemb = self._sess.run(self.neg_tail_vec, feed_dict={self.neg_tail: carr[:,2]})
+    def fit(self, X, batch_size=1024, num_epochs=10):
+        self._get_embedding_sizes(X)
+        self._init_embeddings()
 
-        dists = np.sqrt(np.sum(np.square((semb + pemb) - oemb), axis=1))
-        cdists = np.sqrt(np.sum(np.square((csemb + cpemb) - coemb), axis=1))
-
-        return (cdists < dists.mean()).sum() #/ len(cdists)
-
-
-    @property
-    def _entity_embeddings(self):
-        urns = [self.tarray.entity_dict[i] for i in range(self.tarray.n_entities)]
-        data = self._sess.run(self.pos_head_vec, feed_dict={self.pos_head: np.arange(self.tarray.n_entities)})
-        return pd.DataFrame(data=data, index=urns)
-
-    @property
-    def _predicate_embeddings(self):
-        urns = [self.tarray.predicate_dict[i] for i in range(self.tarray.n_predicates)]
-        data = self._sess.run(self.link_vec, feed_dict={self.link: np.arange(self.tarray.n_predicates)})
-        return pd.DataFrame(data=data, index=urns)
-
-    @property
-    def embeddings(self):
-        return pd.concat((self._entity_embeddings, self._predicate_embeddings))
-
-    def fit(self, graph, batch_size=1024, num_epochs=10, early_stopping_rounds=5, early_stopping_tolerance=1e-6, warm_start=False):
-        if not warm_start:
-            if type(graph) in [rdflib.graph.Graph, pd.core.frame.DataFrame]:
-                print('Vectorizing graph... ', end='', flush=True)
-                self.tarray = TripleArray(graph)
-                print('Done.')
-            elif type(graph) is TripleArray:
-                self.tarray = graph
-            else:
-                raise TypeError("Unexpected type: %s" % type(graph))
-
-            self.tarray.arr = np.random.permutation(self.tarray.arr)
-            self._setup_session(self.tarray.n_entities, self.tarray.n_predicates)
-
-        self.rank_hist = []
-        self.loss_hist = []
-        n_batches = int(len(self.tarray.arr)/batch_size)
+        n_batches = int(len(X) / batch_size)
+        epoch_losses = []
+        pre_out = ''
         for epoch in range(num_epochs):
-            epoch_start = time.time()
-            epoch_losses = []
+            epoch_start = time()
+            self._normalize_embeddings(self.E)
+            batch_losses = []
             for i in range(n_batches):
-                sample = self.tarray.arr[i*batch_size:(i+1)*batch_size]
-                corrupt_sample = corrupt(sample, self.tarray.n_entities)
-                feed  = {self.pos_head: sample[:,0],
-                         self.link    : sample[:,1],
-                         self.pos_tail: sample[:,2],
-                         self.neg_head: corrupt_sample[:,0],
-                         self.neg_tail: corrupt_sample[:,2]}
+                self.optimizer.zero_grad()
+                batch = X[i * batch_size:(i + 1) * batch_size]
+                dist, cdist = self.forward(batch)
+                losses = self.margin + dist - cdist
+                losses = (losses * (losses > 0).float())
+                loss = losses.mean()
+                loss.backward()
+                self.optimizer.step()
 
-                _, loss = self._sess.run([self.train, self.loss], feed_dict=feed)
-                loss /= len(sample)
-                epoch_losses.append(loss)
-
-                elapsed = time.time() - epoch_start
+                batch_losses.append(loss.data[0])
+                elapsed = time() - epoch_start
                 remaining = (n_batches - i) * (elapsed / (1.0 + i))
-                print('Batch: {:d}/{:d}, Loss: {:.3f}, ETA: {:.0f} s'.format(i, n_batches, np.mean(epoch_losses), remaining), end='\r')
 
-            self.rank_hist.append(self.mean_rank_appx())
-            self.loss_hist.append(np.mean(epoch_losses))
-            print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}, Mean Rank: {:.0f}/{:.0f} ({:.2f})'.format(
-                epoch, elapsed, self.loss_hist[-1], self.rank_hist[-1], len(self.tarray.arr), self.rank_hist[-1]/len(self.tarray.arr)))
-            # print('Epoch {:d} took: {:.0f} s, Loss: {:.3f}'.format(epoch, elapsed, self.loss_hist[-1]))
-            # print(self._rdj_test())
-            self.last_epoch = epoch
+                print(pre_out, end='')
+                print('Batch: {:d}/{:d}, Loss: {:.3f}, ETA: {:.0f} s'.format(i, n_batches, np.mean(batch_losses),
+                                                                             remaining))
+                clear_output(1)
+
+            epoch_losses.append(np.mean(batch_losses))
+            rank = self._appx_mean_rank(X)
+            pre_out += 'Epoch: {:d}, Loss: {:.3f}, Mean Rank: {:d}/{:d} ({:.3f}) Time: {:.0f} s\n'.format(epoch,
+                                                                                                          epoch_losses[
+                                                                                                              -1], rank,
+                                                                                                          len(X),
+                                                                                                          rank / len(X),
+                                                                                                          elapsed)
+
+        clear_output(1)
+        print(pre_out, end='')
